@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """
-Dota 2 Patch Notes -> Discord Webhook Notifier
-------------------------------------------------
+Dota 2 Patch Notes -> Discord Webhook Notifier (Russian translation)
+----------------------------------------------------------------------
 Checks Valve's official Steam News feed for Dota 2 (AppID 570) for new
-patch/update posts, and sends any new ones to a Discord webhook.
+patch/update posts, translates them to Russian, and sends the full text
+to a Discord webhook.
 
 Designed to be run on a schedule (cron, GitHub Actions, systemd timer, etc.)
 It keeps track of which posts it has already sent in a small local JSON file
@@ -12,22 +13,13 @@ It keeps track of which posts it has already sent in a small local JSON file
 SETUP
 -----
 1. Install dependencies:
-     pip install requests
+     pip install requests deep-translator
 
-2. Get a Discord webhook URL:
-     Discord server -> Server Settings -> Integrations -> Webhooks -> New Webhook
-     Copy the Webhook URL.
-
-3. Set it as an environment variable (recommended) or edit DISCORD_WEBHOOK_URL below:
+2. Set your webhook URL as an environment variable:
      export DISCORD_WEBHOOK_URL="https://discord.com/api/webhooks/xxxx/yyyy"
 
-4. Run it manually to test:
+3. Run it manually to test:
      python3 dota2_patch_notifier.py
-
-5. Schedule it to run periodically, e.g. every 30 minutes via cron:
-     */30 * * * * cd /path/to/script && /usr/bin/python3 dota2_patch_notifier.py >> notifier.log 2>&1
-
-   Or use a GitHub Actions scheduled workflow (see README notes at bottom).
 """
 
 import json
@@ -37,6 +29,7 @@ import sys
 from pathlib import Path
 
 import requests
+from deep_translator import GoogleTranslator
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -46,25 +39,27 @@ DOTA2_APP_ID = 570
 STEAM_NEWS_URL = "https://api.steampowered.com/ISteamNews/GetNewsForApp/v0002/"
 STATE_FILE = Path(__file__).parent / "state.json"
 
-# You can hardcode your webhook URL here instead of using an env var,
-# but env var is safer (keeps secrets out of source control).
 DISCORD_WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL", "")
 
 # How many recent news items to fetch/check each run
 NEWS_COUNT = 15
 
-# Only treat posts matching these patterns as "patches" (case-insensitive).
-# Dota 2 patch posts are typically titled like "Gameplay Update 7.38" or
-# "7.38 Gameplay Update", "Patch 7.38c", etc.
+# Discord embed description hard limit is 4096 characters; stay under it.
+DISCORD_DESCRIPTION_LIMIT = 4000
+
+# Google Translate (via deep-translator) has a ~5000 char limit per call,
+# so we chunk long patch notes before translating.
+TRANSLATE_CHUNK_SIZE = 4000
+
 PATCH_TITLE_PATTERNS = [
     r"gameplay update",
     r"\bpatch\b",
-    r"\b7\.\d{2}[a-z]?\b",   # version numbers like 7.38, 7.38b
+    r"\b7\.\d{2}[a-z]?\b",
 ]
 
 
 # ---------------------------------------------------------------------------
-# State handling (avoid re-posting the same patch)
+# State handling
 # ---------------------------------------------------------------------------
 
 def load_state() -> dict:
@@ -88,7 +83,7 @@ def fetch_dota2_news() -> list:
     params = {
         "appid": DOTA2_APP_ID,
         "count": NEWS_COUNT,
-        "maxlength": 600,
+        "maxlength": 0,  # 0 = no truncation, return full contents
         "format": "json",
     }
     resp = requests.get(STEAM_NEWS_URL, params=params, timeout=15)
@@ -103,35 +98,88 @@ def is_patch_post(title: str) -> bool:
 
 
 def clean_contents(contents: str) -> str:
-    """Strip BBCode/HTML-ish tags Steam sometimes includes, and trim length."""
+    """Strip BBCode/HTML-ish tags Steam includes, keep full text."""
     text = re.sub(r"\[.*?\]", "", contents)  # strip [bbcode] tags
     text = re.sub(r"<.*?>", "", text)         # strip html tags
-    text = text.strip()
-    if len(text) > 800:
-        text = text[:800].rsplit(" ", 1)[0] + "..."
-    return text
+    text = re.sub(r"\n{3,}", "\n\n", text)    # collapse excess blank lines
+    return text.strip()
+
+
+# ---------------------------------------------------------------------------
+# Translation
+# ---------------------------------------------------------------------------
+
+def translate_to_russian(text: str) -> str:
+    if not text:
+        return text
+    translator = GoogleTranslator(source="auto", target="ru")
+
+    if len(text) <= TRANSLATE_CHUNK_SIZE:
+        return translator.translate(text)
+
+    # Chunk on paragraph breaks to keep translation coherent
+    chunks, current = [], ""
+    for line in text.split("\n"):
+        if len(current) + len(line) + 1 > TRANSLATE_CHUNK_SIZE:
+            chunks.append(current)
+            current = line
+        else:
+            current = f"{current}\n{line}" if current else line
+    if current:
+        chunks.append(current)
+
+    translated_chunks = [translator.translate(chunk) for chunk in chunks]
+    return "\n".join(translated_chunks)
 
 
 # ---------------------------------------------------------------------------
 # Sending to Discord
 # ---------------------------------------------------------------------------
 
+def build_embeds(title_ru: str, url: str, body_ru: str) -> list:
+    """Split long translated text across multiple embeds if needed,
+    since a single embed description is capped at ~4096 chars."""
+    if len(body_ru) <= DISCORD_DESCRIPTION_LIMIT:
+        return [{
+            "title": title_ru[:256],
+            "url": url,
+            "description": body_ru,
+            "color": 0xE03C31,
+            "footer": {"text": "Dota 2 Patch Notes • via Steam News (переведено)"},
+        }]
+
+    # Split into multiple embeds (Discord allows up to 10 per message)
+    parts = []
+    remaining = body_ru
+    while remaining:
+        parts.append(remaining[:DISCORD_DESCRIPTION_LIMIT])
+        remaining = remaining[DISCORD_DESCRIPTION_LIMIT:]
+
+    embeds = []
+    for i, part in enumerate(parts[:10]):
+        embeds.append({
+            "title": title_ru[:256] if i == 0 else None,
+            "url": url if i == 0 else None,
+            "description": part,
+            "color": 0xE03C31,
+            "footer": {"text": "Dota 2 Patch Notes • via Steam News (переведено)"} if i == len(parts) - 1 else None,
+        })
+    return embeds
+
+
 def send_to_discord(webhook_url: str, item: dict) -> None:
-    embed = {
-        "title": item["title"][:256],
-        "url": item["url"],
-        "description": clean_contents(item.get("contents", "")),
-        "color": 0xE03C31,  # Dota red
-        "footer": {"text": "Dota 2 Patch Notes • via Steam News"},
-    }
+    title_ru = translate_to_russian(item["title"])
+    body_ru = translate_to_russian(clean_contents(item.get("contents", "")))
+
+    embeds = build_embeds(title_ru, item["url"], body_ru)
 
     payload = {
         "username": "Dota 2 Patch Bot",
-        "content": f"📢 New Dota 2 update: **{item['title']}**",
-        "embeds": [embed],
+        "content": f"📢 Новое обновление Dota 2: **{title_ru}**",
+        "embeds": embeds,
     }
 
-    resp = requests.post(webhook_url, json=payload, timeout=15)
+    resp = requests.post(webhook_url, json=payload, timeout=30)
     resp.raise_for_status()
 
 
@@ -141,8 +189,7 @@ def send_to_discord(webhook_url: str, item: dict) -> None:
 
 def main():
     if not DISCORD_WEBHOOK_URL:
-        print("ERROR: DISCORD_WEBHOOK_URL is not set. Set it as an env var "
-              "or edit the script.", file=sys.stderr)
+        print("ERROR: DISCORD_WEBHOOK_URL is not set.", file=sys.stderr)
         sys.exit(1)
 
     state = load_state()
@@ -150,8 +197,6 @@ def main():
 
     news_items = fetch_dota2_news()
     patch_items = [n for n in news_items if is_patch_post(n["title"])]
-
-    # Oldest first, so they post to Discord in chronological order
     patch_items.sort(key=lambda n: n["date"])
 
     new_count = 0
